@@ -19,6 +19,12 @@ Requires=network-online.target remote-fs.target local-fs.target
 [Service]
 EnvironmentFile=/etc/sysconfig/oracle
 Type=notify
+# Allow only the main daemon process to send READY=/STATUS= notifications.
+# The daemon removes NOTIFY_SOCKET from its SQL*Plus and lsnrctl children.
+NotifyAccess=main
+# Permit the root daemon to attach Oracle processes restarted outside systemd
+# back to this service's cgroup through systemd's D-Bus API.
+Delegate=yes
 SyslogIdentifier=oracle-service
 TimeoutStartSec=5min
 TimeoutStopSec=5min
