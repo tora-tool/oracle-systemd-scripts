@@ -1,5 +1,45 @@
 #!/usr/bin/env python3
 
+"""Run and keep an Oracle Net listener registered with systemd.
+
+This daemon is the executable for ``oracle-listener.service``.  It runs as
+root so it can re-attach listener processes to the service unit's cgroup, but
+starts and stops ``lsnrctl`` in child processes after dropping privileges to
+``ORACLE_DATABASE_USER`` (``oracle`` by default).  Keeping this parent daemon
+in the unit's cgroup allows a listener restarted outside systemd to be attached
+again, so systemd continues to track its processes during shutdown.
+
+The daemon sends ``READY=1`` after the listener has started and starts a child
+cgroup checker which periodically discovers ``tnslsnr`` processes and attaches
+any process outside this service's cgroup to the systemd unit named by
+``ORACLE_SYSTEMD_UNIT``.  ``oracle-listener.service`` supplies that variable
+as its own unit name.
+
+Listener selection is performed by :func:`parse_listener` after Oracle homes
+are collected from ``/etc/oratab``.  Configuration is read from the service's
+``EnvironmentFile=/etc/sysconfig/oracle``:
+
+    LISTENER_NAME:
+        Optional listener alias to discover in ``listener.ora``.  When set, it
+        takes precedence over ``LISTENER_ORACLE_HOME``.  Discovery requires the
+        bundled ``dotora`` parser.
+
+    LISTENER_ORACLE_HOME:
+        Required when ``LISTENER_NAME`` is unset.  It may be an explicit Oracle
+        home or ``@LATEST@`` to choose the reverse-lexically-last home from
+        ``/etc/oratab`` containing ``bin/tnslsnr``.
+
+    ORACLE_DATABASE_USER:
+        Account used for ``lsnrctl`` child processes.  Defaults to ``oracle``.
+
+    CGROUP_CHECK_INTERVAL:
+        Seconds between listener PID cgroup checks.  Defaults to ``120``.
+
+Signals are wired by the unit: ``SIGUSR2`` stops the listener and exits,
+``SIGTERM`` stops only this daemon, and ``SIGHUP`` re-reads ``/etc/oratab`` and
+repeats listener selection.
+"""
+
 import logging
 import multiprocessing
 import os
@@ -146,6 +186,39 @@ def parse_oratab_homes():
 
 
 def parse_listener():
+    """Select the listener name and Oracle home used by ``lsnrctl``.
+
+    ``parse_oratab_homes()`` must run first and populate
+    ``oracle_ns.oracle_home_list`` from ``/etc/oratab``.  On success, this
+    function sets ``oracle_ns.tnslsnr_oracle_home`` and, when name discovery is
+    used, ``oracle_ns.listener_name``.  The latter defaults to ``LISTENER``.
+
+    Selection has the following precedence:
+
+    1. If ``LISTENER_NAME`` is present in the environment, it is authoritative.
+       ``LISTENER_ORACLE_HOME`` is not used as a fallback.  Each Oracle home
+       from ``oracle_ns.oracle_home_list`` is considered in reverse lexical
+       order.  For each candidate, ``<ORACLE_HOME>/bin/orabasehome`` is run to
+       find the effective base home; if that command fails, the candidate
+       Oracle home itself is used.  The function then parses
+       ``<base-home>/network/admin/listener.ora`` with ``dotora`` and looks for
+       a top-level alias with a ``DESCRIPTION_LIST/DESCRIPTION`` subtree whose
+       name exactly matches ``LISTENER_NAME``.  The first match supplies the
+       Oracle home and actual alias spelling passed to ``lsnrctl``.
+
+    2. If ``LISTENER_NAME`` is unset, ``LISTENER_ORACLE_HOME`` is required.  An
+       explicit value is accepted only when it contains ``bin/tnslsnr``.  The
+       listener name remains the default ``LISTENER``.
+
+    3. ``LISTENER_ORACLE_HOME=@LATEST@`` selects the first reverse-lexically
+       sorted Oracle Home from ``/etc/oratab`` that contains ``bin/tnslsnr``.
+       This is path ordering rather than Oracle-version comparison.
+
+    Any discovery, configuration, or executable-validation failure logs an
+    error, notifies systemd with ``ERRNO=1``, and exits the daemon with status 1.
+    Individual unreadable or unparsable ``listener.ora`` candidates are
+    logged and skipped while name discovery continues with the next home.
+    """
     if 'LISTENER_NAME' in os.environ:
         try:
             from dotora.parser import DotOraFile
